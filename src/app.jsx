@@ -640,7 +640,7 @@ function SessionTimer() {
 
 // ── Session Form (Structured CRV Input) ───────────────────────────────────────
 // onSubmit(sessionData, ideogramData, siteSketchData)
-function SessionForm({ onSubmit, saving }) {
+function SessionForm({ onSubmit, saving, targetRef }) {
   const sessionStart      = useRef(new Date().toISOString()); // stamped at mount
   const [ideogramDecode, setIdeogramDecode] = useState("");
   const [ideogramData,   setIdeogramData]   = useState(null);
@@ -695,6 +695,11 @@ function SessionForm({ onSubmit, saving }) {
 
       {/* ── S1: Ideogram ── */}
       <div style={c.card}>
+        {targetRef && (
+          <p style={{ fontSize: 22, color: "#085041", fontWeight: 700, letterSpacing: "0.05em", margin: "0 0 0.75rem" }}>
+            TARGET REF #{targetRef}
+          </p>
+        )}
         <p style={c.sxHdr}>S1 — Ideogram</p>
         <SketchCanvas
           label="Draw your ideogram"
@@ -1263,7 +1268,6 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
           <Badge status={trial.status} />
         </div>
         <p style={{ ...c.muted, margin: "0 0 0.25rem" }}>{fmtDate(trial)}{trial.market ? ` · ${trial.market}` : ""}</p>
-        {trial.targetRef && <p style={{ fontSize: 12, color: "#085041", fontWeight: 600, letterSpacing: "0.06em", margin: "0 0 1rem" }}>TARGET REF #{trial.targetRef}</p>}
         <Stepper steps={STEPS} current={step} />
         <Notify msg={notify} />
 
@@ -1304,6 +1308,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                 <p style={c.muted}>Clear your mind completely. Do not think about markets, prices, teams, or outcomes. Simply perceive and describe the target image you sense you will be shown after this session.</p>
                 <SessionForm
                   saving={saving}
+                  targetRef={trial.targetRef}
                   onSubmit={async (sessionData, ideogramData, siteSketchData) => {
                     const sessionIdx = sessions.length;
                     if (ideogramData)   { try { await saveSketch(trial.id, sessionIdx, "ideogram", ideogramData); } catch {} }
@@ -1329,7 +1334,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                 {["A","B"].map(s => (
                   <div key={s}>
                     <p style={{ ...c.label, marginBottom: 6 }}>Image {s}</p>
-                    <TrialImage trialId={trial.id} side={s} style={c.imgBox} />
+                    <TrialImage trialId={trial.id} side={s} style={c.imgFull} />
                   </div>
                 ))}
               </div>
@@ -2131,14 +2136,10 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
           <div>
             <button style={{ ...c.btn, marginBottom: "1rem" }} onClick={goBack}>← Back to trials</button>
             <h2 style={{ ...c.h2, margin: "0 0 0.25rem" }}>{selectedTrial.cue || "Remote Viewing Trial"}</h2>
-            {selectedTrial.targetRef && (
-              <p style={{ fontSize: 12, color: "#085041", fontWeight: 600, letterSpacing: "0.06em", margin: "0 0 0.75rem" }}>
-                TARGET REF #{selectedTrial.targetRef} — note this for your own records
-              </p>
-            )}
             <p style={{ ...c.muted, marginBottom: "1.25rem" }}>Clear your mind. Do not think about markets, teams, prices, or outcomes. Simply describe the image you sense you will be shown. Work through each stage below.</p>
             <SessionForm
               saving={saving}
+              targetRef={selectedTrial.targetRef}
               onSubmit={(sessionData, ideogramData, siteSketchData) => {
                 onSubmit(selectedTrial.id, sessionData, ideogramData, siteSketchData);
               }}
