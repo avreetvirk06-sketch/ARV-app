@@ -176,7 +176,7 @@ function outLabel(t, which) {
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 const c = {
-  wrap:   { padding: "1.25rem", maxWidth: 680, margin: "0 auto", fontFamily: "var(--font-sans)" },
+  wrap:   { padding: "1.25rem", maxWidth: 1100, margin: "0 auto", fontFamily: "var(--font-sans)" },
   h1:     { fontSize: 21, fontWeight: 500, margin: "0 0 0.2rem", color: "var(--color-text-primary)" },
   h2:     { fontSize: 17, fontWeight: 500, margin: "0 0 0.75rem", color: "var(--color-text-primary)" },
   h3:     { fontSize: 14, fontWeight: 500, margin: "0 0 0.4rem", color: "var(--color-text-primary)" },
@@ -507,6 +507,17 @@ function SketchCanvas({ onExport, height = 220, label, hint }) {
     };
   }, [handleStart, handleMove, handleEnd]);
 
+  // Track mouse at window level so strokes continue when the cursor
+  // leaves the canvas boundary and resume seamlessly on re-entry
+  useEffect(() => {
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup",   handleEnd);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup",   handleEnd);
+    };
+  }, [handleMove, handleEnd]);
+
   function clearCanvas() {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
@@ -559,21 +570,17 @@ function SketchCanvas({ onExport, height = 220, label, hint }) {
       {/* Canvas */}
       <canvas
         ref={canvasRef}
-        width={600}
+        width={1200}
         height={height * 2}
         style={{
           width: "100%", height, display: "block",
-          border: "0.5px solid var(--color-border-secondary)",
-          borderTop: "none",
-          borderRadius: "0 0 var(--border-radius-md) var(--border-radius-md)",
+          border: "1.5px solid #1a1a1a",
+          borderRadius: "var(--border-radius-md)",
           cursor: tool === "eraser" ? "cell" : "crosshair",
           touchAction: "none",
           background: "#ffffff",
         }}
         onMouseDown={handleStart}
-        onMouseMove={handleMove}
-        onMouseUp={handleEnd}
-        onMouseLeave={handleEnd}
       />
     </div>
   );
@@ -692,7 +699,7 @@ function SessionForm({ onSubmit, saving }) {
         <SketchCanvas
           label="Draw your ideogram"
           hint="First spontaneous mark — draw without thinking"
-          height={150}
+          height={450}
           onExport={setIdeogramData}
         />
         <div style={c.field}>
@@ -732,7 +739,7 @@ function SessionForm({ onSubmit, saving }) {
         <p style={c.sxHdr}>S4 — Site Sketch</p>
         <SketchCanvas
           hint="Sketch key elements. Label A, B, C etc."
-          height={280}
+          height={500}
           onExport={setSiteSketchData}
         />
       </div>
@@ -1221,9 +1228,10 @@ function stepIdx(status) { return { viewing: 1, judging: 2, predicted: 3, comple
 function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRepeat }) {
   const [page, setPage] = useState("list");
   const [tid,  setTid]  = useState(null);
-  const [vote, setVote] = useState(null);
-  const [judgeNotes, setJudgeNotes] = useState("");
+  const [soloVotes, setSoloVotes] = useState({});
+  const [soloNotes, setSoloNotes] = useState({});
   const [actual, setActual] = useState("");
+  const [meditationDone, setMeditationDone] = useState(false);
 
   const soloTrials = trials.filter(t => t.solo);
   const trial = tid ? trials.find(t => t.id === tid) : null;
@@ -1238,15 +1246,18 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
   }
 
   if (page === "trial" && trial) {
-    const step     = stepIdx(trial.status);
-    const mySession = trial.sessions?.[0];
-    const myVote   = trial.judgments?.[0]?.vote;
-    const upL      = outLabel(trial, "Up");
-    const downL    = outLabel(trial, "Down");
+    const step      = stepIdx(trial.status);
+    const sessions  = trial.sessions || [];
+    const mySession = sessions[0];
+    const upL       = outLabel(trial, "Up");
+    const downL     = outLabel(trial, "Down");
+    const allVoted  = sessions.length > 0 && sessions.every((_, i) => soloVotes[i]);
+    const aCount    = Object.values(soloVotes).filter(v => v === "A").length;
+    const bCount    = Object.values(soloVotes).filter(v => v === "B").length;
 
     return (
       <div style={c.wrap}>
-        <button style={{ ...c.btn, marginBottom: "1rem" }} onClick={() => { setPage("list"); setTid(null); }}>← Back</button>
+        <button style={{ ...c.btn, marginBottom: "1rem" }} onClick={() => { setPage("list"); setTid(null); setMeditationDone(false); setSoloVotes({}); setSoloNotes({}); }}>← Back</button>
         <div style={{ ...c.row, marginBottom: "0.25rem" }}>
           <h2 style={{ ...c.h2, margin: 0 }}>{trial.question || trial.market || "Trial"}</h2>
           <Badge status={trial.status} />
@@ -1258,31 +1269,62 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
 
         {/* STEP 1 — VIEW */}
         {trial.status === "viewing" && (
-          <div style={c.card}>
-            <h3 style={c.h3}>Step 1 — Remote Viewing Session</h3>
-            <p style={c.muted}>Clear your mind completely. Do not think about markets, prices, teams, or outcomes. Simply perceive and describe the target image you sense you will be shown after this session.</p>
-            <SessionForm
-              saving={saving}
-              onSubmit={async (sessionData, ideogramData, siteSketchData) => {
-                // Save sketch data to storage before updating trial
-                if (ideogramData)   { try { await saveSketch(trial.id, 0, "ideogram", ideogramData); } catch {} }
-                if (siteSketchData) { try { await saveSketch(trial.id, 0, "site", siteSketchData); } catch {} }
-                await onUpdate(trial.id, {
-                  sessions: [{ viewerName, ...sessionData, timestamp: new Date().toISOString() }],
-                  status: "judging",
-                });
-                setVote(null);
-              }}
-            />
-          </div>
+          <>
+            {/* ── Completed sessions so far ── */}
+            {sessions.length > 0 && (
+              <div style={c.card}>
+                <div style={{ ...c.row, marginBottom: "1rem", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                  <h3 style={{ ...c.h3, margin: 0 }}>
+                    {sessions.length} session{sessions.length !== 1 ? "s" : ""} completed
+                  </h3>
+                  <button style={c.btnP} disabled={saving}
+                    onClick={async () => { await onUpdate(trial.id, { status: "judging" }); }}>
+                    Judge sessions →
+                  </button>
+                </div>
+                {sessions.map((s, i) => (
+                  <div key={i}>
+                    <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 6px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Session {i + 1}</p>
+                    <SessionDisplay session={s} trialId={trial.id} sessionIdx={i} showConfidence />
+                    {i < sessions.length - 1 && <div style={{ ...c.sep, margin: "0.75rem 0" }} />}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Meditation or session form ── */}
+            {!meditationDone ? (
+              <div style={c.card}>
+                <h3 style={c.h3}>{sessions.length > 0 ? `Session ${sessions.length + 1} — Meditation` : "Step 1 — Pre-Session Meditation"}</h3>
+                <MeditationTimer onComplete={() => setMeditationDone(true)} />
+              </div>
+            ) : (
+              <div style={c.card}>
+                <h3 style={c.h3}>{sessions.length > 0 ? `Session ${sessions.length + 1}` : "Step 1 — Remote Viewing Session"}</h3>
+                <p style={c.muted}>Clear your mind completely. Do not think about markets, prices, teams, or outcomes. Simply perceive and describe the target image you sense you will be shown after this session.</p>
+                <SessionForm
+                  saving={saving}
+                  onSubmit={async (sessionData, ideogramData, siteSketchData) => {
+                    const sessionIdx = sessions.length;
+                    if (ideogramData)   { try { await saveSketch(trial.id, sessionIdx, "ideogram", ideogramData); } catch {} }
+                    if (siteSketchData) { try { await saveSketch(trial.id, sessionIdx, "site",     siteSketchData); } catch {} }
+                    await onUpdate(trial.id, {
+                      sessions: [...sessions, { viewerName, ...sessionData, timestamp: new Date().toISOString() }],
+                    });
+                    setMeditationDone(false); // ready for another session if wanted
+                  }}
+                />
+              </div>
+            )}
+          </>
         )}
 
         {/* STEP 2 — JUDGE */}
         {trial.status === "judging" && (
           <div>
             <div style={c.card}>
-              <h3 style={c.h3}>Step 2 — Judge Your Session</h3>
-              <p style={c.muted}>Both images are now revealed. Read your session honestly and decide which image it better matches — set aside any market preference.</p>
+              <h3 style={c.h3}>Step 2 — Judge Your Sessions</h3>
+              <p style={c.muted}>Both images are now revealed. Read each session and decide which image it better matches — set aside any market preference.</p>
               <div style={c.half}>
                 {["A","B"].map(s => (
                   <div key={s}>
@@ -1292,38 +1334,54 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                 ))}
               </div>
             </div>
-            <div style={c.card}>
-              <div style={{ ...c.row, marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
-                <p style={{ fontWeight: 500, fontSize: 13, margin: 0 }}>Your session</p>
-                {sessionDurationLabel(mySession) && (
-                  <span style={{ fontSize: 12, color: "#085041", fontWeight: 600, background: "#08504112", padding: "2px 8px", borderRadius: 99 }}>
-                    ⏱ {sessionDurationLabel(mySession)}
-                  </span>
-                )}
+
+            {sessions.map((sess, i) => (
+              <div key={i} style={c.card}>
+                <div style={{ ...c.row, marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
+                  <p style={{ fontWeight: 500, fontSize: 13, margin: 0 }}>Session {i + 1}</p>
+                  {sessionDurationLabel(sess) && (
+                    <span style={{ fontSize: 12, color: "#085041", fontWeight: 600, background: "#08504112", padding: "2px 8px", borderRadius: 99 }}>
+                      ⏱ {sessionDurationLabel(sess)}
+                    </span>
+                  )}
+                </div>
+                <SessionDisplay session={sess} trialId={trial.id} sessionIdx={i} />
+                <div style={{ ...c.sep, margin: "1rem 0" }} />
+                <label style={c.label}>Which image does session {i + 1} better match?</label>
+                <div style={{ ...c.row, marginBottom: "0.75rem" }}>
+                  {[["A","Image A"],["B","Image B"],["M","Mixed / unclear"]].map(([v,l]) => (
+                    <button key={v} style={{ ...c.btn, ...(soloVotes[i] === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
+                      onClick={() => setSoloVotes(p => ({ ...p, [i]: v }))}>{l}</button>
+                  ))}
+                </div>
+                <div style={c.field}>
+                  <label style={c.label}>Notes <span style={{ fontWeight: 400, textTransform: "none" }}>(optional)</span></label>
+                  <textarea style={{ ...c.area, minHeight: 70 }} value={soloNotes[i] || ""}
+                    onChange={e => setSoloNotes(p => ({ ...p, [i]: e.target.value }))}
+                    placeholder="Which elements matched? Why did you choose this image?" />
+                </div>
               </div>
-              <SessionDisplay session={mySession} trialId={trial.id} sessionIdx={0} />
-              <div style={{ ...c.sep, margin: "1rem 0" }} />
-              <label style={c.label}>Which image does your session better match?</label>
-              <div style={{ ...c.row, marginBottom: "1rem" }}>
-                {[["A","Image A"],["B","Image B"],["M","Mixed / unclear"]].map(([v,l]) => (
-                  <button key={v} style={{ ...c.btn, ...(vote === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
-                    onClick={() => setVote(v)}>{l}</button>
-                ))}
-              </div>
-              <div style={{ ...c.field, marginBottom: "1rem" }}>
-                <label style={c.label}>Judging notes <span style={{ fontWeight: 400, textTransform: "none" }}>(optional)</span></label>
-                <textarea style={{ ...c.area, minHeight: 80 }} value={judgeNotes} onChange={e => setJudgeNotes(e.target.value)}
-                  placeholder="Note which elements of your session matched the image, and why you chose it. Useful for reviewing patterns over time." />
-              </div>
-              <button style={c.btnP} disabled={!vote || saving}
+            ))}
+
+            <div style={{ ...c.card, background: "var(--color-background-secondary)" }}>
+              <p style={{ fontSize: 13, margin: "0 0 10px" }}>
+                Tally — A: <strong>{aCount}</strong> · B: <strong>{bCount}</strong>
+                {aCount !== bCount && aCount + bCount > 0 && <> · Majority → <strong>Image {aCount > bCount ? "A" : "B"}</strong></>}
+                {aCount === bCount && aCount > 0 && <> · <span style={{ color: "var(--color-text-warning)" }}>Tied — no clear prediction</span></>}
+              </p>
+              <button style={c.btnP} disabled={!allVoted || saving}
                 onClick={async () => {
-                  const winner = vote === "M" ? null : vote;
+                  const validVotes = Object.values(soloVotes).filter(v => v !== "M");
+                  const a = validVotes.filter(v => v === "A").length;
+                  const b = validVotes.filter(v => v === "B").length;
+                  const winner = a > b ? "A" : b > a ? "B" : null;
                   const prediction = winner === null ? null : winner === trial.upImage ? "Up" : "Down";
-                  await onUpdate(trial.id, { judgments: [{ vote, notes: judgeNotes }], prediction, status: "predicted" });
-                  setVote(null);
-                  setJudgeNotes("");
+                  const judgments = sessions.map((_, i) => ({ vote: soloVotes[i] || "M", notes: soloNotes[i] || "" }));
+                  await onUpdate(trial.id, { judgments, prediction, status: "predicted" });
+                  setSoloVotes({});
+                  setSoloNotes({});
                 }}>
-                {saving ? "Saving…" : "Submit Judgment →"}
+                {saving ? "Saving…" : `Submit Judgments (${Object.keys(soloVotes).length}/${sessions.length})`}
               </button>
             </div>
           </div>
@@ -1340,8 +1398,16 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                     {outLabel(trial, trial.prediction)}
                   </p>
                   <p style={{ ...c.muted, margin: "0 0 8px" }}>
-                    Your session matched Image {myVote}, sealed as <strong>{outLabel(trial, trial.prediction)}</strong>.
+                    {trial.judgments?.length > 1
+                      ? <>Majority of {trial.judgments.length} sessions voted → sealed as <strong>{outLabel(trial, trial.prediction)}</strong>.</>
+                      : <>Session matched Image <strong>{trial.judgments?.[0]?.vote}</strong>, sealed as <strong>{outLabel(trial, trial.prediction)}</strong>.</>
+                    }
                   </p>
+                  {trial.judgments?.length > 1 && (
+                    <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 8px" }}>
+                      A: {trial.judgments.filter(j => j.vote === "A").length} · B: {trial.judgments.filter(j => j.vote === "B").length} · Mixed: {trial.judgments.filter(j => j.vote === "M").length}
+                    </p>
+                  )}
                   {mySession?.confidence && <ConfidencePill value={mySession.confidence} />}
                 </>
               ) : (
@@ -1395,15 +1461,18 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                 <div>
                   <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
                   <TrialImage trialId={trial.id} side={trial.feedbackSide} style={c.imgFull} />
-                  {mySession?.sessionStart && mySession?.sessionEnd && (() => {
-                    const durMs = new Date(mySession.sessionEnd) - new Date(mySession.sessionStart);
-                    const durMin = Math.round(durMs / 60000);
-                    return <p style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: "6px 0 0" }}>Session duration: {durMin} min</p>;
-                  })()}
                 </div>
                 <div>
-                  <p style={{ ...c.label, marginBottom: 6 }}>Your session</p>
-                  <SessionDisplay session={mySession} trialId={trial.id} sessionIdx={0} />
+                  <p style={{ ...c.label, marginBottom: 6 }}>Your session{sessions.length > 1 ? "s" : ""}</p>
+                  {sessions.map((s, i) => (
+                    <div key={i} style={{ marginBottom: i < sessions.length - 1 ? "0.75rem" : 0 }}>
+                      {sessions.length > 1 && (
+                        <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 4px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Session {i + 1}</p>
+                      )}
+                      <SessionDisplay session={s} trialId={trial.id} sessionIdx={i} showConfidence={i === 0} />
+                      {i < sessions.length - 1 && <div style={{ ...c.sep, margin: "0.5rem 0" }} />}
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
@@ -1750,12 +1819,37 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
 // ── Meditation Timer ─────────────────────────────────────────────────────────
 function MeditationTimer({ onComplete }) {
   const [seconds, setSeconds] = useState(180);
+  const hasRung = useRef(false);
+
+  function playBell() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Three gentle sine-wave tones spaced 0.9 s apart
+      [0, 0.9, 1.8].forEach(delay => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = "sine";
+        osc.frequency.value = 432; // calming A4 variant
+        const t = ctx.currentTime + delay;
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.35, t + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 2.6);
+        osc.start(t);
+        osc.stop(t + 2.6);
+      });
+    } catch {}
+  }
 
   useEffect(() => {
-    if (seconds <= 0) { onComplete(); return; }
+    if (seconds <= 0) {
+      if (!hasRung.current) { hasRung.current = true; playBell(); }
+      return; // stay on screen — user clicks "Begin session →"
+    }
     const id = setTimeout(() => setSeconds(s => s - 1), 1000);
     return () => clearTimeout(id);
-  }, [seconds, onComplete]);
+  }, [seconds]);
 
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
@@ -1775,7 +1869,7 @@ function MeditationTimer({ onComplete }) {
         <div style={{ height: "100%", width: `${pct}%`, background: "#085041", borderRadius: 3, transition: "width 1s linear" }} />
       </div>
       <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "0 0 1.25rem", fontStyle: "italic" }}>
-        {seconds > 0 ? "Observe thoughts without engaging them — then let them go." : "Timer complete. Begin when ready."}
+        {seconds > 0 ? "Observe thoughts without engaging them — then let them go." : "🔔 Timer complete — begin when ready."}
       </p>
       <button style={{ ...c.btn, fontSize: 13, padding: "8px 20px" }} onClick={onComplete}>
         {seconds > 0 ? "Skip meditation →" : "Begin session →"}
