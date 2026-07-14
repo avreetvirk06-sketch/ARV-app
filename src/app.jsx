@@ -169,6 +169,16 @@ function fmtDate(t) {
   const base = t.targetDate || t.date || "";
   return base + (t.targetTime ? " at " + t.targetTime : "");
 }
+// Formats an ISO timestamp (e.g. session.sessionStart / session.timestamp) into a
+// readable date + time string, e.g. "Jul 14, 2026 at 3:45 PM"
+function fmtDateTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const datePart = d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  const timePart = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return `${datePart} at ${timePart}`;
+}
 function outLabel(t, which) {
   if (which === "Up") return t?.outcomeUp?.trim() || "Up ↑";
   return t?.outcomeDown?.trim() || "Down ↓";
@@ -1422,6 +1432,9 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
             {trial.prediction && (
               <div style={{ ...c.card, background: "var(--color-background-secondary)" }}>
                 <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 4px" }}>Timing</p>
+                <p style={{ ...c.muted, margin: "0 0 4px" }}>
+                  Session done: {fmtDateTime(mySession?.sessionStart || mySession?.timestamp) || "—"}
+                </p>
                 <p style={{ ...c.muted, margin: 0 }}>
                   Act at: {fmtDate(trial)}. Do not hold beyond the prediction window.
                 </p>
