@@ -2142,6 +2142,7 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
   // Every finished trial this viewer took part in (feedback released), newest first
   const feedbackTrials = myTrials
     .filter(t => t.status === "complete" && getFeedbackSide(t))
+    // most recently judged first: by when the outcome/feedback was recorded (older trials without that fall back to session time)
     .sort((a, b) => (b.completedAt || when(b)).localeCompare(a.completedAt || when(a)));
 
   function goBack() { setSelectedTrialId(null); setMeditationDone(false); }
@@ -2181,8 +2182,21 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
                       <span style={{ fontSize: 12, color: rColor, fontWeight: 500, whiteSpace: "nowrap" }}>{rLabel} {open ? "▲" : "▼"}</span>
                     </button>
                     {open && (
-                      <div style={{ marginTop: 6 }}>
-                        <TrialImage trialId={t.id} side={getFeedbackSide(t)} style={{ ...c.imgFull, maxHeight: 460 }} />
+                      <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", alignItems: "start" }}>
+                        <div>
+                          <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
+                          <TrialImage trialId={t.id} side={getFeedbackSide(t)} style={c.imgFull} />
+                          {(() => {
+                            const myS = mine(t);
+                            if (!myS?.sessionStart || !myS?.sessionEnd) return null;
+                            const durMin = Math.round((new Date(myS.sessionEnd) - new Date(myS.sessionStart)) / 60000);
+                            return <p style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: "6px 0 0" }}>Session duration: {durMin} min</p>;
+                          })()}
+                        </div>
+                        <div>
+                          <p style={{ ...c.label, marginBottom: 6 }}>Your session</p>
+                          <SessionDisplay session={mine(t)} trialId={t.id} sessionIdx={Math.max(0, (t.sessions || []).indexOf(mine(t)))} showConfidence />
+                        </div>
                       </div>
                     )}
                   </div>
