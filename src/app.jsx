@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
+// Storage keys — unchanged from v5 so all existing trials, images, sketches and viewers keep working.
 const DATA_KEY = "arv-v5-data";
 const imgKey = (id, s) => `arv-v5-img-${id}-${s}`;
 const sketchKey = (trialId, idx, type) => `arv-v5-sk-${trialId}-${idx}-${type}`;
+// New keys: each submitted session is its own record, so two viewers can never overwrite each other.
+const sessKey = (trialId, sid) => `arv-v5-sess-${trialId}-${sid}`;
+const sidxKey = trialId => `arv-v5-sidx-${trialId}`;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function resizeImage(file, maxPx = 480) {
@@ -29,38 +33,26 @@ async function resizeImage(file, maxPx = 480) {
   });
 }
 
-const BACKUP_KEY = "arv-v5-data-backup";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function loadTrialData() {
-  try { const r = await window.storage.get(DATA_KEY, true); return r ? JSON.parse(r.value) : { trials: [] }; }
-  catch { return { trials: [] }; }
-}
-// Can we actually talk to storage? (tiny write + read of a harmless key)
-const PING_KEY = "arv-v5-ping";
-async function storageReachable() {
-  try {
-    const stamp = String(Date.now());
-    const w = await window.storage.set(PING_KEY, stamp, true);
-    if (!w) return false;
-    const r = await window.storage.get(PING_KEY, true);
-    return !!r && r.value === stamp;
-  } catch { return false; }
-}
-// Safe loader: retries. If the data key can't be read but storage itself works, the key simply
-// doesn't exist yet (fresh storage) -> treated as empty (empty:true). Real outages -> failed:true.
-async function loadTrialDataSafe() {
-  for (let i = 0; i < 2; i++) {
+// Highest trial count successfully read so far. If a later read comes back "empty" while this is > 0 it is
+// treated as a failed read (never as "no data"), so a storage hiccup can't wipe or overwrite your trials.
+let knownTrialCount = 0;
+
+async function readTrialData() {
+  for (let i = 0; i < 3; i++) {
     try {
       const r = await window.storage.get(DATA_KEY, true);
-      if (!r) return { data: { trials: [] }, failed: false, empty: true, raw: null };
-      const d = JSON.parse(r.value);
-      if (!Array.isArray(d.trials)) d.trials = [];
-      return { data: d, failed: false, empty: false, raw: r.value };
-    } catch { await sleep(250 * (i + 1)); }
+      if (r && r.value) {
+        const d = JSON.parse(r.value);
+        if (!Array.isArray(d.trials)) d.trials = [];
+        knownTrialCount = d.trials.length;
+        return { data: d, missing: false };
+      }
+    } catch {}
+    if (i < 2) await sleep(300);
   }
-  if (await storageReachable()) return { data: { trials: [] }, failed: false, empty: true, raw: null };
-  return { data: { trials: [] }, failed: true, empty: false, raw: null };
+  return { data: { trials: [] }, missing: true };
 }
 async function saveTrialData(d) {
   const result = await window.storage.set(DATA_KEY, JSON.stringify(d), true);
@@ -72,13 +64,77 @@ async function saveImg(id, side, b64) {
   const result = await window.storage.set(imgKey(id, side), b64, true);
   if (!result) throw new Error("Failed to save image " + side);
 }
+const imgCache = {};
 async function loadImg(id, side) {
-  for (let i = 0; i < 3; i++) {
-    try { const r = await window.storage.get(imgKey(id, side), true); if (r?.value) return r.value; } catch {}
-    await sleep(300 * (i + 1));
+  const k = imgKey(id, side);
+  if (imgCache[k]) return imgCache[k];
+  try {
+    const r = await window.storage.get(k, true);
+    if (r && r.value) { imgCache[k] = r.value; return r.value; }
+    return null;
+  } catch { return null; }
+}
+
+// ── Session store ─────────────────────────────────────────────────────────────
+// Sessions used to live inside the one shared DATA_KEY blob, so two viewers submitting at about the same
+// time would overwrite each other (last write wins). New sessions are now saved as their own record plus a
+// tiny per-trial index of session ids. Sessions already stored inside old trials are still read as before.
+const sessionRecCache = {};   // sid -> session record (records never change once written)
+const sessionsByTrial = {};   // trialId -> every new-style session seen so far (never shrinks)
+
+function unionById(a, b) {
+  const seen = new Set(a.map(s => s.id));
+  return [...a, ...b.filter(s => !seen.has(s.id))];
+}
+async function readSessionIndex(trialId, tries = 1) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await window.storage.get(sidxKey(trialId), true);
+      if (r && r.value) { const a = JSON.parse(r.value); if (Array.isArray(a)) return a; }
+    } catch {}
+    if (i < tries - 1) await sleep(250);
   }
   return null;
 }
+// Adds a session id to the trial's index, then checks it really stuck. If another viewer's write landed at
+// the same moment and replaced ours, it is added again — so no session can silently disappear.
+async function addSessionToIndex(trialId, sid) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const cur = (await readSessionIndex(trialId, 3)) || [];
+    if (!cur.includes(sid)) {
+      const res = await window.storage.set(sidxKey(trialId), JSON.stringify([...cur, sid]), true);
+      if (!res) throw new Error("Could not save the session index");
+    }
+    await sleep(400 + Math.random() * 500);
+    const check = await readSessionIndex(trialId, 2);
+    if (check && check.includes(sid)) return;
+  }
+  throw new Error("Session saved but could not be registered — please press Submit again");
+}
+async function fetchSessionRecord(trialId, sid) {
+  if (sessionRecCache[sid]) return sessionRecCache[sid];
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await window.storage.get(sessKey(trialId, sid), true);
+      if (r && r.value) { const s = JSON.parse(r.value); sessionRecCache[sid] = s; return s; }
+    } catch {}
+  }
+  return null;
+}
+// Returns { trialId: [sessions] }. Finished trials are only re-read on a full (manual) refresh.
+async function loadAllSessions(trials, full) {
+  const out = {};
+  await Promise.all(trials.map(async t => {
+    if (!full && t.status === "complete" && sessionsByTrial[t.id]) { out[t.id] = sessionsByTrial[t.id]; return; }
+    const ids  = (await readSessionIndex(t.id)) || [];
+    const recs = (await Promise.all(ids.map(sid => fetchSessionRecord(t.id, sid)))).filter(Boolean);
+    const merged = unionById(sessionsByTrial[t.id] || [], recs);
+    sessionsByTrial[t.id] = merged;
+    out[t.id] = merged;
+  }));
+  return out;
+}
+
 async function saveSketch(trialId, idx, type, b64) {
   if (!b64) return;
   try { await window.storage.set(sketchKey(trialId, idx, type), b64, true); } catch {}
@@ -212,9 +268,42 @@ function fmtDateTime(iso) {
   return `${datePart} at ${timePart}`;
 }
 function outLabel(t, which) {
-  if (!which) return "None";
-  if (which === "Up") return t?.outcomeUp?.trim() || "Up ↑";
-  return t?.outcomeDown?.trim() || "Down ↓";
+  if (which === "Up")   return t?.outcomeUp?.trim()   || "Up ↑";
+  if (which === "Down") return t?.outcomeDown?.trim() || "Down ↓";
+  return "No prediction";
+}
+// "correct" | "incorrect" | "none" (none = votes were mixed / tied, so no prediction was made)
+function resultOf(t) { return !t?.prediction ? "none" : t.actual === t.prediction ? "correct" : "incorrect"; }
+const RESULT_UI = {
+  correct:   ["✓ Correct",       "var(--color-text-success)"],
+  incorrect: ["✗ Incorrect",     "var(--color-text-danger)"],
+  none:      ["— No prediction", "var(--color-text-secondary)"],
+};
+// Which image is the "correct" one once the actual outcome is known
+function getFeedbackSide(t) {
+  if (!t) return null;
+  if (t.feedbackSide) return t.feedbackSide;
+  if (t.actual === "Up")   return t.upImage;
+  if (t.actual === "Down") return t.upImage === "A" ? "B" : "A";
+  return null;
+}
+const normName = s => (s || "").trim().toLowerCase();
+function sameViewer(a, b) { return normName(a) === normName(b); }
+// Finds the judgment for a session: by session id when it has one, otherwise by position (older trials)
+function judgmentFor(trial, sess, i) {
+  const js = trial?.judgments || [];
+  return sess?.id ? (js.find(j => j.sessionId === sess.id) || null) : (js[i] || null);
+}
+// Old sessions (inside the trial record) first, then new-style sessions in the order they were submitted
+function mergeTrials(rawTrials, extra) {
+  return rawTrials.map(t => {
+    const legacy = t.sessions || [];
+    const have   = new Set(legacy.map(s => s.id).filter(Boolean));
+    const added  = (extra[t.id] || [])
+      .filter(s => !have.has(s.id))
+      .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || "") || String(a.id).localeCompare(String(b.id)));
+    return added.length ? { ...t, sessions: [...legacy, ...added] } : t;
+  });
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -229,7 +318,7 @@ const c = {
   label:  { fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 5, display: "block", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" },
   input:  { width: "100%", padding: "8px 12px", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", fontSize: 14, fontFamily: "var(--font-sans)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", boxSizing: "border-box" },
   area:   { width: "100%", padding: "10px 12px", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", fontSize: 14, fontFamily: "var(--font-sans)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical", minHeight: 140, boxSizing: "border-box", lineHeight: 1.7 },
-  btn:    { cursor: "pointer", padding: "8px 16px", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", background: "transparent", fontSize: 14, color: "var(--color-text-primary)", fontFamily: "var(--font-sans)" },
+  btn:    { cursor: "pointer", padding: "8px 16px", borderWidth: "0.5px", borderStyle: "solid", borderColor: "var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", background: "transparent", fontSize: 14, color: "var(--color-text-primary)", fontFamily: "var(--font-sans)" },
   btnP:   { cursor: "pointer", padding: "9px 20px", border: "none", borderRadius: "var(--border-radius-md)", background: "#085041", fontSize: 14, color: "white", fontFamily: "var(--font-sans)", fontWeight: 500 },
   row:    { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
   sep:    { borderTop: "0.5px solid var(--color-border-tertiary)", margin: "1.25rem 0" },
@@ -241,6 +330,7 @@ const c = {
 
 const STATUS = {
   viewing:   { label: "Open",            bg: "var(--color-background-info)",      tc: "var(--color-text-info)" },
+  judging:   { label: "Judging",         bg: "var(--color-background-info)",      tc: "var(--color-text-info)" },
   predicted: { label: "Prediction made", bg: "var(--color-background-secondary)", tc: "var(--color-text-secondary)" },
   complete:  { label: "Complete",        bg: "var(--color-background-secondary)", tc: "var(--color-text-secondary)" },
 };
@@ -271,25 +361,16 @@ function Stepper({ steps, current }) {
   );
 }
 function TrialImage({ trialId, side, style }) {
-  const [src, setSrc] = useState(null);
-  const [state, setState] = useState("loading");
-  const [tick, setTick] = useState(0);
+  const [src, setSrc]       = useState(null);
+  const [failed, setFailed] = useState(false);
   useEffect(() => {
-    let cancelled = false;
-    setSrc(null); setState("loading");
-    if (!trialId || !side) { setState("missing"); return; }
-    loadImg(trialId, side).then(s => {
-      if (cancelled) return;
-      if (s) { setSrc(s); setState("ok"); } else setState("missing");
-    });
-    return () => { cancelled = true; };
-  }, [trialId, side, tick]);
-  if (state === "loading") return <div style={{ ...style, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "var(--color-text-secondary)", minHeight: 80 }}>Loading…</div>;
-  if (state === "missing") return (
-    <div style={{ ...style, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: "var(--color-text-secondary)", minHeight: 80 }}>
-      Image unavailable <button style={{ ...c.btn, fontSize: 11, padding: "2px 8px" }} onClick={() => setTick(t => t + 1)}>Retry</button>
-    </div>
-  );
+    let live = true;
+    setSrc(null); setFailed(false);
+    if (!trialId || !side) { setFailed(true); return; }
+    loadImg(trialId, side).then(s => { if (!live) return; if (s) setSrc(s); else setFailed(true); });
+    return () => { live = false; };
+  }, [trialId, side]);
+  if (!src) return <div style={{ ...style, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>{failed ? "Image unavailable" : "Loading…"}</div>;
   return <img src={src} style={style} alt={`Image ${side}`} />;
 }
 async function fileToBase64(file) {
@@ -522,8 +603,8 @@ function SketchCanvas({ onExport, height = 220, label, hint }) {
   }, []);
 
   const handleMove = useCallback((e) => {
-    e.preventDefault();
     if (!isDrawingRef.current || !lastPosRef.current) return;
+    e.preventDefault();
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     const pos = getPos(e);
@@ -540,8 +621,8 @@ function SketchCanvas({ onExport, height = 220, label, hint }) {
   }, []);
 
   const handleEnd = useCallback((e) => {
-    if (e) e.preventDefault();
     if (!isDrawingRef.current) return;
+    if (e && e.cancelable) e.preventDefault();
     isDrawingRef.current = false;
     lastPosRef.current = null;
     if (hasDrawingRef.current) {
@@ -849,15 +930,16 @@ function SessionDisplay({ session, trialId, sessionIdx, showConfidence = true })
   const [ideogram,   setIdeogram]   = useState(null);
   const [siteSketch, setSiteSketch] = useState(null);
 
-  const skId = session?.sid ?? sessionIdx;   // new sessions use a unique id; old ones keep using their index
   useEffect(() => {
+    if (trialId == null || sessionIdx == null) return;
+    let live = true;
     setIdeogram(null); setSiteSketch(null);
-    if (trialId == null || skId == null) return;
-    let cancelled = false;
-    loadSketch(trialId, skId, "ideogram").then(d => { if (d && !cancelled) setIdeogram(d); });
-    loadSketch(trialId, skId, "site").then(d => { if (d && !cancelled) setSiteSketch(d); });
-    return () => { cancelled = true; };
-  }, [trialId, skId]);
+    // New sessions keep their sketches under their own id; older sessions use their position in the trial
+    const ref = session?.id || sessionIdx;
+    loadSketch(trialId, ref, "ideogram").then(d => { if (live && d) setIdeogram(d); });
+    loadSketch(trialId, ref, "site").then(d => { if (live && d) setSiteSketch(d); });
+    return () => { live = false; };
+  }, [trialId, sessionIdx, session?.id]);
 
   if (!session) return null;
 
@@ -1018,7 +1100,6 @@ function NewTrialForm({ onBack, onSave, saving, soloMode }) {
     onSave({
       question, market, outcomeUp, outcomeDown, cue,
       targetDate, targetTime, notes: trialNotes,
-      createdAt: new Date().toISOString(),
       targetRef: genTargetRef(), upImage: Math.random() < 0.5 ? "A" : "B",
       assignedViewers,
       imgA, imgB,
@@ -1292,7 +1373,7 @@ function RoleSelect({ onSelect }) {
 const STEPS = ["Setup", "View", "Judge", "Predict", "Done"];
 function stepIdx(status) { return { viewing: 1, judging: 2, predicted: 3, complete: 4 }[status] ?? 0; }
 
-function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRepeat }) {
+function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRepeat, onAddSession }) {
   const [page, setPage] = useState("list");
   const [tid,  setTid]  = useState(null);
   const [soloVotes, setSoloVotes] = useState({});
@@ -1307,8 +1388,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
     return <NewTrialForm soloMode saving={saving} onBack={() => setPage("list")}
       onSave={async (fields) => {
         const t = { id: uid(), ...fields, solo: true, soloViewer: viewerName, status: "viewing", sessions: [], judgments: [], prediction: null, actual: null };
-        const ok = await onCreate(t);
-        if (ok) setPage("list");
+        if (await onCreate(t)) setPage("list");
       }} />;
   }
 
@@ -1349,7 +1429,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                   </button>
                 </div>
                 {sessions.map((s, i) => (
-                  <div key={s.sid || i}>
+                  <div key={s.id || i}>
                     <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 6px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Session {i + 1}</p>
                     <SessionDisplay session={s} trialId={trial.id} sessionIdx={i} showConfidence />
                     {i < sessions.length - 1 && <div style={{ ...c.sep, margin: "0.75rem 0" }} />}
@@ -1372,12 +1452,8 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                   saving={saving}
                   targetRef={trial.targetRef}
                   onSubmit={async (sessionData, ideogramData, siteSketchData) => {
-                    const sid = uid();
-                    if (ideogramData)   { try { await saveSketch(trial.id, sid, "ideogram", ideogramData); } catch {} }
-                    if (siteSketchData) { try { await saveSketch(trial.id, sid, "site",     siteSketchData); } catch {} }
-                    const newSession = { sid, viewerName, ...sessionData, timestamp: new Date().toISOString() };
-                    await onUpdate(trial.id, t => ({ sessions: [...(t.sessions || []), newSession] }));
-                    setMeditationDone(false); // ready for another session if wanted
+                    const ok = await onAddSession(trial.id, viewerName, sessionData, ideogramData, siteSketchData);
+                    if (ok) setMeditationDone(false); // ready for another session if wanted
                   }}
                 />
               </div>
@@ -1402,7 +1478,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
             </div>
 
             {sessions.map((sess, i) => (
-              <div key={sess.sid || i} style={c.card}>
+              <div key={sess.id || i} style={c.card}>
                 <div style={{ ...c.row, marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
                   <p style={{ fontWeight: 500, fontSize: 13, margin: 0 }}>Session {i + 1}</p>
                   {sessionDurationLabel(sess) && (
@@ -1442,8 +1518,9 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                   const b = validVotes.filter(v => v === "B").length;
                   const winner = a > b ? "A" : b > a ? "B" : null;
                   const prediction = winner === null ? null : winner === trial.upImage ? "Up" : "Down";
-                  const judgments = sessions.map((_, i) => ({ vote: soloVotes[i] || "M", notes: soloNotes[i] || "" }));
-                  await onUpdate(trial.id, { judgments, prediction, status: "predicted" });
+                  const judgments = sessions.map((s, i) => ({ vote: soloVotes[i] || "M", notes: soloNotes[i] || "", sessionId: s.id }));
+                  const ok = await onUpdate(trial.id, { judgments, prediction, status: "predicted" });
+                  if (!ok) return;
                   setSoloVotes({});
                   setSoloNotes({});
                 }}>
@@ -1503,8 +1580,8 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
               <button style={c.btnP} disabled={!actual || saving}
                 onClick={async () => {
                   const feedbackSide = actual === "Up" ? trial.upImage : (trial.upImage === "A" ? "B" : "A");
-                  await onUpdate(trial.id, { actual, feedbackSide, status: "complete" });
-                  setActual("");
+                  const ok = await onUpdate(trial.id, { actual, feedbackSide, completedAt: new Date().toISOString(), status: "complete" });
+                  if (ok) setActual("");
                 }}>
                 {saving ? "Saving…" : "Record & See Feedback →"}
               </button>
@@ -1515,9 +1592,9 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
         {/* STEP 4 — COMPLETE */}
         {trial.status === "complete" && (
           <div>
-            <div style={{ ...c.card, background: trial.actual === trial.prediction ? "var(--color-background-success)" : "var(--color-background-danger)" }}>
-              <h3 style={{ ...c.h3, color: trial.actual === trial.prediction ? "var(--color-text-success)" : "var(--color-text-danger)" }}>
-                {trial.actual === trial.prediction ? "✓ Correct prediction" : "✗ Incorrect prediction"}
+            <div style={{ ...c.card, background: resultOf(trial) === "correct" ? "var(--color-background-success)" : resultOf(trial) === "incorrect" ? "var(--color-background-danger)" : "var(--color-background-secondary)" }}>
+              <h3 style={{ ...c.h3, color: RESULT_UI[resultOf(trial)][1] }}>
+                {resultOf(trial) === "correct" ? "✓ Correct prediction" : resultOf(trial) === "incorrect" ? "✗ Incorrect prediction" : "— No prediction was made (mixed / tied)"}
               </h3>
               <p style={{ fontSize: 14, margin: 0 }}>
                 Predicted <strong>{outLabel(trial, trial.prediction)}</strong> · Actual <strong>{outLabel(trial, trial.actual)}</strong>
@@ -1529,12 +1606,12 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", alignItems: "start" }}>
                 <div>
                   <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
-                  <TrialImage trialId={trial.id} side={trial.feedbackSide} style={c.imgFull} />
+                  <TrialImage trialId={trial.id} side={getFeedbackSide(trial)} style={c.imgFull} />
                 </div>
                 <div>
                   <p style={{ ...c.label, marginBottom: 6 }}>Your session{sessions.length > 1 ? "s" : ""}</p>
                   {sessions.map((s, i) => (
-                    <div key={s.sid || i} style={{ marginBottom: i < sessions.length - 1 ? "0.75rem" : 0 }}>
+                    <div key={s.id || i} style={{ marginBottom: i < sessions.length - 1 ? "0.75rem" : 0 }}>
                       {sessions.length > 1 && (
                         <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 4px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Session {i + 1}</p>
                       )}
@@ -1571,7 +1648,7 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
                 {t.targetRef && <p style={{ fontSize: 11, color: "#085041", margin: "2px 0 0", fontWeight: 600, letterSpacing: "0.06em" }}>REF #{t.targetRef}</p>}
               </div>
               <Badge status={t.status} />
-              {t.status === "complete" && <span style={{ marginLeft: "auto", fontSize: 12, color: t.actual === t.prediction ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{t.actual === t.prediction ? "✓ Correct" : "✗ Incorrect"}</span>}
+              {t.status === "complete" && <span style={{ marginLeft: "auto", fontSize: 12, color: RESULT_UI[resultOf(t)][1] }}>{RESULT_UI[resultOf(t)][0]}</span>}
             </div>
             <div style={{ display: "flex", gap: 3, marginTop: 8 }}>
               {STEPS.map((_, i) => <div key={i} style={{ height: 3, flex: 1, borderRadius: 2, background: i <= step ? "#085041" : "var(--color-background-secondary)" }} />)}
@@ -1584,41 +1661,106 @@ function SoloView({ viewerName, trials, saving, notify, onCreate, onUpdate, onRe
   );
 }
 
+// ── Shared: correct (feedback) image with the session(s) beside it ───────────
+function FeedbackPanel({ trial, side, sessions, title }) {
+  return (
+    <div style={{ ...c.card, marginTop: "0.75rem" }}>
+      <h3 style={c.h3}>{title || "Feedback"}</h3>
+      <p style={c.muted}>The image associated with the actual outcome, shown beside what the viewer(s) described.</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", alignItems: "start" }}>
+        <div>
+          <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
+          <TrialImage trialId={trial.id} side={side} style={c.imgFull} />
+        </div>
+        <div>
+          <p style={{ ...c.label, marginBottom: 6 }}>Session{sessions.length !== 1 ? "s" : ""} ({sessions.length})</p>
+          {sessions.length === 0 && <p style={c.muted}>No sessions were submitted for this trial.</p>}
+          {sessions.map((s, i) => (
+            <div key={s.id || i} style={{ marginBottom: i < sessions.length - 1 ? "0.75rem" : 0 }}>
+              <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 4px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                {s.viewerName || `Session ${i + 1}`}
+              </p>
+              <SessionDisplay session={s} trialId={trial.id} sessionIdx={i} showConfidence />
+              {i < sessions.length - 1 && <div style={{ ...c.sep, margin: "0.5rem 0" }} />}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Shared: per-session judgments + resulting prediction ─────────────────────
+function JudgmentList({ trial, sessions }) {
+  return (
+    <>
+      <h3 style={c.h3}>Judgments</h3>
+      {sessions.map((s, i) => {
+        const j = judgmentFor(trial, s, i);
+        return (
+          <div key={s.id || i} style={{ marginBottom: j?.notes ? 10 : 4 }}>
+            <p style={{ fontSize: 13, margin: 0 }}>
+              {s.viewerName || `Session ${i + 1}`}:{" "}
+              {j
+                ? <strong>{j.vote === "M" ? "Mixed" : `Image ${j.vote}`}</strong>
+                : <span style={{ color: "var(--color-text-warning)" }}>not judged — submitted after judging, not part of this prediction</span>}
+            </p>
+            {j?.notes && (
+              <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "3px 0 0", fontStyle: "italic", paddingLeft: 8, borderLeft: "2px solid var(--color-border-tertiary)" }}>
+                {j.notes}
+              </p>
+            )}
+          </div>
+        );
+      })}
+      <p style={{ fontSize: 14, marginTop: 8, marginBottom: 0 }}>
+        {trial.prediction
+          ? <>Prediction: <strong>{outLabel(trial, trial.prediction)}</strong></>
+          : "Mixed / tied — no clear prediction."}
+      </p>
+    </>
+  );
+}
+
 // ── Coordinator ───────────────────────────────────────────────────────────────
 function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJudge }) {
-  const [page, setPage] = useState("list");
-  const [tid, setTid]   = useState(null);
-  const [actual, setActual] = useState("");
-  const [votes, setVotes]   = useState({});
+  const [page, setPage]         = useState("list");
+  const [tid, setTid]           = useState(null);
+  const [actual, setActual]     = useState("");
+  const [votes, setVotes]       = useState({});
+  const [showBoth, setShowBoth] = useState(false);
   const groupTrials = trials.filter(t => !t.solo);
-  const trial = tid ? trials.find(t => t.id === tid) : null;
+  const trial     = tid ? trials.find(t => t.id === tid) : null;
   const sessions  = trial?.sessions || [];
-  const aCount    = Object.values(votes).filter(v => v === "A").length;
-  const bCount    = Object.values(votes).filter(v => v === "B").length;
-  const allVoted  = sessions.length > 0 && sessions.every((_, i) => votes[i]);
+  const vk        = (s, i) => s.id || `idx-${i}`;   // vote key: stays correct even if the session list grows or reorders
+  const voteOf    = (s, i) => votes[vk(s, i)];
+  const aCount    = sessions.filter((s, i) => voteOf(s, i) === "A").length;
+  const bCount    = sessions.filter((s, i) => voteOf(s, i) === "B").length;
+  const answered  = sessions.filter((s, i) => voteOf(s, i)).length;
+  const allVoted  = sessions.length > 0 && answered === sessions.length;
+
+  function backToList() { setPage("list"); setTid(null); setVotes({}); setActual(""); setShowBoth(false); }
 
   if (page === "new") {
     return <NewTrialForm saving={saving} onBack={() => setPage("list")}
       onSave={async (fields) => {
         const t = { id: uid(), ...fields, solo: false, status: "viewing", sessions: [], judgments: [], prediction: null, actual: null };
-        const ok = await onCreate(t);
-        if (ok) setPage("list");
+        if (await onCreate(t)) setPage("list");
       }} />;
   }
 
   if (page === "trial" && trial) {
     const upL   = outLabel(trial, "Up");
     const downL = outLabel(trial, "Down");
-    const isViewing   = trial.status === "viewing";
+    const isViewing = trial.status === "viewing";
     const isPredicted = trial.status === "predicted";
-    const isComplete  = trial.status === "complete";
-    // image that matches the outcome button currently selected
-    const previewSide = actual ? (actual === "Up" ? trial.upImage : (trial.upImage === "A" ? "B" : "A")) : null;
-    const outBtn = v => ({ ...c.btn, ...(actual === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) });
+    const isComplete = trial.status === "complete";
+    // Image that goes with the outcome currently picked (preview before it is saved)
+    const pickSide = actual ? (actual === "Up" ? trial.upImage : (trial.upImage === "A" ? "B" : "A")) : null;
 
     return (
       <div style={c.wrap}>
-        <button style={{ ...c.btn, marginBottom: "1rem" }} onClick={() => { setPage("list"); setTid(null); setVotes({}); setActual(""); }}>← Back</button>
+        <button style={{ ...c.btn, marginBottom: "1rem" }} onClick={backToList}>← Back</button>
         <div style={{ ...c.row, marginBottom: "0.25rem" }}>
           <h2 style={{ ...c.h2, margin: 0 }}>{trial.question || trial.market || "Trial"}</h2>
           <Badge status={trial.status} />
@@ -1634,30 +1776,27 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
         {isComplete
           ? <p style={{ ...c.muted, marginBottom: "1rem" }}>Image {trial.upImage} = <strong>{upL}</strong> · Image {trial.upImage === "A" ? "B" : "A"} = <strong>{downL}</strong></p>
           : <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
-              🔒 {isPredicted ? "Outcome assignment sealed — select the actual outcome below to reveal the matching feedback image" : "Outcome assignment sealed until judging is complete"}
+              🔒 {isViewing ? "Outcome assignment sealed until judging is complete" : "Images stay hidden until you pick the actual outcome"}
             </p>}
         <Notify msg={notify} />
 
-        {/* Both images only while judging (sealed) or after the trial is complete */}
-        {(isViewing || isComplete) && (
-          <div style={c.half}>
-            {["A","B"].map(s => (
-              <div key={s}>
-                <p style={{ ...c.label, marginBottom: 6 }}>Image {s}{isComplete ? ` — ${trial.upImage === s ? upL : downL}` : ""}</p>
-                <TrialImage trialId={trial.id} side={s} style={c.imgBox} />
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Session list is hidden at the "predicted" stage – it appears next to the feedback image instead */}
-        {!isPredicted && (
+        {/* ── OPEN: both images + every submitted session, then judging ── */}
+        {isViewing && (
           <>
+            <div style={c.half}>
+              {["A","B"].map(s => (
+                <div key={s}>
+                  <p style={{ ...c.label, marginBottom: 6 }}>Image {s}</p>
+                  <TrialImage trialId={trial.id} side={s} style={c.imgBox} />
+                </div>
+              ))}
+            </div>
+
             <div style={c.sep} />
             <h3 style={c.h3}>Sessions ({sessions.length})</h3>
-            {!sessions.length ? <p style={c.muted}>No sessions yet.</p>
+            {!sessions.length ? <p style={c.muted}>No sessions yet. New submissions appear here automatically.</p>
               : sessions.map((s, i) => (
-                <div key={s.sid || i} style={{ ...c.card, marginBottom: "0.5rem" }}>
+                <div key={vk(s, i)} style={{ ...c.card, marginBottom: "0.5rem" }}>
                   <div style={{ ...c.row, marginBottom: 8 }}>
                     <p style={{ fontWeight: 500, fontSize: 13, margin: 0 }}>{s.viewerName}</p>
                     {s.confidence && <ConfidencePill value={s.confidence} />}
@@ -1666,18 +1805,14 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
                 </div>
               ))
             }
-          </>
-        )}
 
-        {sessions.length > 0 && (
-          <>
-            <div style={c.sep} />
-            {isViewing ? (
+            {sessions.length > 0 && (
               <>
+                <div style={c.sep} />
                 <h3 style={c.h3}>Judge sessions</h3>
                 <p style={c.muted}>Compare each session to both images above and vote for the better match. The outcome assignment is still sealed.</p>
                 {sessions.map((sess, i) => (
-                  <div key={sess.sid || i} style={c.card}>
+                  <div key={vk(sess, i)} style={c.card}>
                     <div style={{ ...c.row, marginBottom: 10 }}>
                       <p style={{ fontWeight: 500, fontSize: 14, margin: 0 }}>Session {i+1} — {sess.viewerName}</p>
                       {sess.confidence && <ConfidencePill value={sess.confidence} />}
@@ -1685,8 +1820,8 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
                     <label style={c.label}>Which image does this session better match?</label>
                     <div style={c.row}>
                       {[["A","Image A"],["B","Image B"],["M","Mixed"]].map(([v,l]) => (
-                        <button key={v} style={{ ...c.btn, ...(votes[i] === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
-                          onClick={() => setVotes(p => ({ ...p, [i]: v }))}>{l}</button>
+                        <button key={v} style={{ ...c.btn, ...(voteOf(sess, i) === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
+                          onClick={() => setVotes(p => ({ ...p, [vk(sess, i)]: v }))}>{l}</button>
                       ))}
                     </div>
                   </div>
@@ -1698,113 +1833,88 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
                     {aCount === bCount && aCount > 0 && <> · <span style={{ color: "var(--color-text-warning)" }}>Tied — no trade</span></>}
                   </p>
                   <button style={c.btnP} disabled={!allVoted || saving}
-                    onClick={() => onJudge(trial.id, sessions.map((_, i) => ({ vote: votes[i] || "M" })))}>
-                    {saving ? "Submitting…" : `Submit Judgments (${Object.keys(votes).length}/${sessions.length})`}
+                    onClick={() => onJudge(trial.id, sessions.map((s, i) => ({ vote: voteOf(s, i) || "M", sessionId: s.id })))}>
+                    {saving ? "Submitting…" : `Submit Judgments (${answered}/${sessions.length})`}
                   </button>
                 </div>
               </>
-            ) : (
-              <>
-                <h3 style={c.h3}>Judgments</h3>
-                {trial.judgments?.map((j, i) => (
-                  <div key={i} style={{ marginBottom: j.notes ? 10 : 4 }}>
-                    <p style={{ fontSize: 13, margin: 0 }}>
-                      {trial.sessions?.[i]?.viewerName || `Session ${i+1}`}: <strong>{j.vote === "M" ? "Mixed" : `Image ${j.vote}`}</strong>
-                    </p>
-                    {j.notes && (
-                      <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "3px 0 0", fontStyle: "italic", paddingLeft: 8, borderLeft: "2px solid var(--color-border-tertiary)" }}>
-                        {j.notes}
-                      </p>
-                    )}
-                  </div>
-                ))}
-                <p style={{ fontSize: 14, marginTop: 8 }}>
-                  Prediction: <strong>{trial.prediction ? outLabel(trial, trial.prediction) : "None — tied / mixed (no trade)"}</strong>
-                </p>
-              </>
             )}
-            <div style={{ ...c.card, marginTop: "1rem", borderColor: "#085041" }}>
-              <h3 style={c.h3}>🔁 Repeat this trial</h3>
-              <p style={c.muted}>Open the same target to another viewer, or have someone redo it. Same images, new reference number, fresh randomisation.</p>
-              <button style={c.btnP} disabled={saving} onClick={() => onRepeat(trial.id)}>
-                Repeat this trial
-              </button>
-            </div>
           </>
         )}
 
-        {/* ── Record outcome: two buttons, then reveal only the matching image + sessions ── */}
+        {/* ── PREDICTION MADE: no images — pick the outcome, then the correct image + sessions appear ── */}
         {isPredicted && (
           <>
-            <div style={c.sep} />
-            <h3 style={c.h3}>Record actual outcome</h3>
-            <p style={c.muted}>Select what actually happened. The matching feedback image and the session(s) will appear for review before you release feedback.</p>
-            <div style={{ ...c.row, marginBottom: "0.75rem" }}>
-              {[["Up", upL], ["Down", downL]].map(([v, l]) => (
-                <button key={v} style={outBtn(v)} onClick={() => setActual(v)}>{l}</button>
-              ))}
+            <div style={c.card}>
+              <JudgmentList trial={trial} sessions={sessions} />
             </div>
 
-            {previewSide && (
-              <div style={{ ...c.card, borderColor: "#085041", marginBottom: "0.75rem" }}>
-                <h3 style={c.h3}>Feedback preview — {outLabel(trial, actual)}</h3>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", alignItems: "start" }}>
-                  <div>
-                    <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
-                    <TrialImage key={previewSide} trialId={trial.id} side={previewSide} style={c.imgFull} />
-                  </div>
-                  <div>
-                    <p style={{ ...c.label, marginBottom: 6 }}>Session{sessions.length > 1 ? "s" : ""}</p>
-                    {sessions.map((s, i) => (
-                      <div key={s.sid || i} style={{ marginBottom: i < sessions.length - 1 ? "0.75rem" : 0 }}>
-                        <p style={{ fontSize: 11, fontWeight: 700, color: "#085041", margin: "0 0 4px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                          {s.viewerName || `Session ${i + 1}`}
-                        </p>
-                        <SessionDisplay session={s} trialId={trial.id} sessionIdx={i} showConfidence />
-                        {i < sessions.length - 1 && <div style={{ ...c.sep, margin: "0.5rem 0" }} />}
-                      </div>
-                    ))}
-                  </div>
-                </div>
+            <div style={{ ...c.card, borderColor: "#085041" }}>
+              <h3 style={c.h3}>Record actual outcome</h3>
+              <p style={c.muted}>Choose what actually happened. The matching image and the session(s) appear once you pick one.</p>
+              <div style={{ ...c.row, marginBottom: actual ? "0.75rem" : 0 }}>
+                {[["Up", upL], ["Down", downL]].map(([v, l]) => (
+                  <button key={v} style={{ ...c.btn, ...(actual === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
+                    onClick={() => setActual(v)}>{l}</button>
+                ))}
               </div>
-            )}
+              {actual && (
+                <button style={c.btnP} disabled={saving}
+                  onClick={async () => {
+                    const ok = await onUpdate(trial.id, { actual, feedbackSide: pickSide, completedAt: new Date().toISOString(), status: "complete" });
+                    if (ok) setActual("");
+                  }}>
+                  {saving ? "Saving…" : `Confirm “${outLabel(trial, actual)}” & release feedback`}
+                </button>
+              )}
+            </div>
 
-            <button style={c.btnP} disabled={!actual || saving}
-              onClick={async () => {
-                const feedbackSide = actual === "Up" ? trial.upImage : (trial.upImage === "A" ? "B" : "A");
-                await onUpdate(trial.id, { actual, feedbackSide, status: "complete" });
-                setActual("");
-              }}>
-              {saving ? "Saving…" : "Record & Release Feedback"}
-            </button>
+            {actual && (
+              <FeedbackPanel trial={trial} side={pickSide} sessions={sessions} title={`Preview — ${outLabel(trial, actual)} (not saved until you confirm)`} />
+            )}
           </>
         )}
 
+        {/* ── COMPLETE: result, correct image + sessions, judgments ── */}
         {isComplete && (
           <>
-            <div style={{ ...c.card, marginTop: "1rem", background: !trial.prediction ? "var(--color-background-secondary)" : trial.actual === trial.prediction ? "var(--color-background-success)" : "var(--color-background-danger)" }}>
+            <div style={{ ...c.card, background: resultOf(trial) === "correct" ? "var(--color-background-success)" : resultOf(trial) === "incorrect" ? "var(--color-background-danger)" : "var(--color-background-secondary)" }}>
               <p style={{ fontSize: 14, margin: 0 }}>
                 Prediction: <strong>{outLabel(trial, trial.prediction)}</strong> · Actual: <strong>{outLabel(trial, trial.actual)}</strong> ·{" "}
-                {!trial.prediction
-                  ? <span style={{ color: "var(--color-text-secondary)" }}>No trade (tied)</span>
-                  : trial.actual === trial.prediction
-                    ? <span style={{ color: "var(--color-text-success)" }}>Correct ✓</span>
-                    : <span style={{ color: "var(--color-text-danger)" }}>Incorrect ✗</span>}
+                <span style={{ color: RESULT_UI[resultOf(trial)][1] }}>{RESULT_UI[resultOf(trial)][0]}</span>
               </p>
             </div>
-            {trial.feedbackSide && (
-              <div style={{ ...c.card, marginTop: "0.75rem" }}>
-                <h3 style={c.h3}>Feedback Image (released to viewers)</h3>
-                <p style={{ ...c.muted, margin: "0 0 0.75rem" }}>
-                  Image {trial.feedbackSide} — associated with the actual outcome <strong>{outLabel(trial, trial.actual)}</strong>
-                </p>
-                <TrialImage trialId={trial.id} side={trial.feedbackSide} style={c.imgBox} />
-                <p style={{ fontSize: 12, color: "var(--color-text-secondary)", marginTop: 8, marginBottom: 0 }}>
-                  Viewers can open this from their "Feedback on previous trials" menu.
-                </p>
+
+            <FeedbackPanel trial={trial} side={getFeedbackSide(trial)} sessions={sessions} title="Feedback (released to viewers)" />
+
+            <div style={c.card}>
+              <JudgmentList trial={trial} sessions={sessions} />
+            </div>
+
+            <button style={{ ...c.btn, marginBottom: "0.75rem" }} onClick={() => setShowBoth(v => !v)}>
+              {showBoth ? "Hide both images" : "Show both images"}
+            </button>
+            {showBoth && (
+              <div style={{ ...c.half, marginBottom: "0.75rem" }}>
+                {["A","B"].map(s => (
+                  <div key={s}>
+                    <p style={{ ...c.label, marginBottom: 6 }}>Image {s} — {trial.upImage === s ? upL : downL}</p>
+                    <TrialImage trialId={trial.id} side={s} style={c.imgBox} />
+                  </div>
+                ))}
               </div>
             )}
           </>
+        )}
+
+        {sessions.length > 0 && (
+          <div style={{ ...c.card, marginTop: "1rem", borderColor: "#085041" }}>
+            <h3 style={c.h3}>🔁 Repeat this trial</h3>
+            <p style={c.muted}>Open the same target to another viewer, or have someone redo it. Same images, new reference number, fresh randomisation.</p>
+            <button style={c.btnP} disabled={saving} onClick={() => onRepeat(trial.id)}>
+              Repeat this trial
+            </button>
+          </div>
         )}
       </div>
     );
@@ -1913,14 +2023,14 @@ function CoordView({ trials, saving, notify, onCreate, onUpdate, onRepeat, onJud
                   {t.targetRef && <p style={{ fontSize: 11, color: "#085041", margin: "2px 0 0", fontWeight: 600, letterSpacing: "0.06em" }}>REF #{t.targetRef}</p>}
                 </div>
                 <Badge status={t.status} />
-                <span style={{ marginLeft: "auto", fontSize: 12, color: !t.prediction ? "var(--color-text-secondary)" : t.actual === t.prediction ? "var(--color-text-success)" : "var(--color-text-danger)", fontWeight: 500 }}>
-                  {!t.prediction ? "— No trade" : t.actual === t.prediction ? "✓ Correct" : "✗ Incorrect"}
+                <span style={{ marginLeft: "auto", fontSize: 12, color: RESULT_UI[resultOf(t)][1], fontWeight: 500 }}>
+                  {RESULT_UI[resultOf(t)][0]}
                 </span>
               </div>
               {t.prediction && (
                 <p style={{ fontSize: 13, margin: "6px 0 0" }}>
                   Prediction: <strong>{outLabel(t, t.prediction)}</strong> · Actual: <strong>{outLabel(t, t.actual)}</strong>
-                  {t.feedbackSide && <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}> · Feedback: Image {t.feedbackSide}</span>}
+                  {getFeedbackSide(t) && <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}> · Feedback: Image {getFeedbackSide(t)}</span>}
                 </p>
               )}
             </div>
@@ -1996,51 +2106,43 @@ function MeditationTimer({ onComplete }) {
 // ── Viewer ────────────────────────────────────────────────────────────────────
 function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
   const groupTrials  = trials.filter(t => !t.solo);
-  const activeTrials = groupTrials.filter(t => t.status === "viewing" && (!t.assignedViewers?.length || t.assignedViewers.includes(viewerName)));
+  const activeTrials = groupTrials.filter(t => t.status === "viewing" && (!t.assignedViewers?.length || t.assignedViewers.some(v => sameViewer(v, viewerName))));
   const [showFeedback, setShowFeedback]       = useState(false);
+  const [openFeedbackId, setOpenFeedbackId]   = useState(null);
   const [showStats, setShowStats]             = useState(false);
-  const [feedbackId, setFeedbackId]           = useState(null);
   const [selectedTrialId, setSelectedTrialId] = useState(null);
   const [meditationDone, setMeditationDone]   = useState(false);
-  const selectedTrial = selectedTrialId ? activeTrials.find(t => t.id === selectedTrialId) : null;
-  const alreadyDone   = selectedTrial?.sessions?.some(s => s.viewerName === viewerName);
+  // Looked up among all trials (not just open ones) so a form in progress never disappears if the coordinator moves on
+  const selectedTrial = selectedTrialId ? groupTrials.find(t => t.id === selectedTrialId) : null;
+  const mine          = t => (t.sessions || []).find(s => sameViewer(s.viewerName, viewerName));
+  const alreadyDone   = !!(selectedTrial && mine(selectedTrial));
 
   // Stats derived from all trials this viewer has participated in
-  const myTrials      = groupTrials.filter(t => t.sessions?.some(s => s.viewerName === viewerName));
-  const judgedTrials  = myTrials.filter(t => t.status === "complete" && t.feedbackSide && t.prediction);
+  const myTrials      = groupTrials.filter(t => mine(t));
+  const judgedTrials  = myTrials.filter(t => t.status === "complete" && t.prediction);
   const correctCount  = judgedTrials.filter(t => t.actual === t.prediction).length;
   const accuracy      = judgedTrials.length > 0 ? Math.round((correctCount / judgedTrials.length) * 100) : null;
-  const mySessions    = groupTrials.flatMap(t => (t.sessions || []).filter(s => s.viewerName === viewerName));
+  const mySessions    = groupTrials.flatMap(t => (t.sessions || []).filter(s => sameViewer(s.viewerName, viewerName)));
   const confSessions  = mySessions.filter(s => s.confidence);
   const avgConf       = confSessions.length > 0
     ? Math.round(confSessions.reduce((sum, s) => sum + s.confidence, 0) / confSessions.length * 10) / 10
     : null;
-  const hiConfJudged  = judgedTrials.filter(t => {
-    const s = t.sessions?.find(se => se.viewerName === viewerName);
-    return s?.confidence >= 7;
-  });
+  const hiConfJudged  = judgedTrials.filter(t => mine(t)?.confidence >= 7);
   const hiConfCorrect = hiConfJudged.filter(t => t.actual === t.prediction).length;
 
   // Current correct streak — sorted by viewer's own session timestamp, count back from most recent
-  const sortedJudged = [...judgedTrials].sort((a, b) => {
-    const ta = a.sessions?.find(s => s.viewerName === viewerName)?.timestamp || "";
-    const tb = b.sessions?.find(s => s.viewerName === viewerName)?.timestamp || "";
-    return ta.localeCompare(tb);
-  });
+  const when = t => mine(t)?.timestamp || "";
+  const sortedJudged = [...judgedTrials].sort((a, b) => when(a).localeCompare(when(b)));
   let currentStreak = 0;
   for (let i = sortedJudged.length - 1; i >= 0; i--) {
-    const t = sortedJudged[i];
-    if (t.prediction === null) continue;           // tied — skip, don't break streak
-    if (t.actual === t.prediction) { currentStreak++; }
+    if (sortedJudged[i].actual === sortedJudged[i].prediction) { currentStreak++; }
     else { break; }
   }
 
-  // Every completed trial with released feedback where this viewer participated (newest first)
-  const mySessionTime = t => t.sessions?.find(s => s.viewerName === viewerName)?.timestamp || "";
-  const feedbackTrials = [...groupTrials]
-    .filter(t => t.status === "complete" && t.feedbackSide && t.sessions?.some(s => s.viewerName === viewerName))
-    .sort((a, b) => mySessionTime(b).localeCompare(mySessionTime(a)));
-  const feedbackTrial = feedbackTrials.find(t => t.id === feedbackId) || feedbackTrials[0] || null;
+  // Every finished trial this viewer took part in (feedback released), newest first
+  const feedbackTrials = myTrials
+    .filter(t => t.status === "complete" && getFeedbackSide(t))
+    .sort((a, b) => (b.completedAt || when(b)).localeCompare(a.completedAt || when(a)));
 
   function goBack() { setSelectedTrialId(null); setMeditationDone(false); }
 
@@ -2050,29 +2152,42 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
       <p style={c.muted}>Perceive the target image you will be shown in the future</p>
       <Notify msg={notify} />
 
-      {/* ── Feedback on previous trials (dropdown of every trial with released feedback) ── */}
+      {/* ── Feedback for every trial this viewer has received feedback on ── */}
       {feedbackTrials.length > 0 && (
         <div style={{ marginBottom: "1.25rem" }}>
           <button
             style={{ ...c.btn, width: "100%", textAlign: "left", padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderColor: showFeedback ? "#085041" : "var(--color-border-secondary)", background: showFeedback ? "#08504108" : "transparent" }}
             onClick={() => setShowFeedback(v => !v)}>
-            <span style={{ fontWeight: 500, fontSize: 14 }}>📋 Feedback on previous trials</span>
+            <span style={{ fontWeight: 500, fontSize: 14 }}>📋 View feedback on previous trials</span>
             <span style={{ fontSize: 12, color: "var(--color-text-secondary)", fontWeight: 500 }}>
               {feedbackTrials.length} trial{feedbackTrials.length !== 1 ? "s" : ""} {showFeedback ? "▲" : "▼"}
             </span>
           </button>
-          {showFeedback && feedbackTrial && (
-            <div style={{ ...c.card, borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0, borderColor: "#085041" }}>
-              <label style={c.label}>Choose a trial</label>
-              <select style={{ ...c.input, marginBottom: "0.75rem" }} value={feedbackTrial.id} onChange={e => setFeedbackId(e.target.value)}>
-                {feedbackTrials.map(t => (
-                  <option key={t.id} value={t.id}>
-                    {(t.targetRef ? `REF #${t.targetRef}` : "Trial")}{fmtDate(t) ? ` · ${fmtDate(t)}` : ""}
-                  </option>
-                ))}
-              </select>
-              <p style={{ ...c.label, marginBottom: 6 }}>Feedback image</p>
-              <TrialImage key={feedbackTrial.id} trialId={feedbackTrial.id} side={feedbackTrial.feedbackSide} style={c.imgFull} />
+          {showFeedback && (
+            <div style={{ ...c.card, borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0, borderColor: "#085041", padding: "0.4rem 1rem" }}>
+              {feedbackTrials.map((t, n) => {
+                const open = openFeedbackId === t.id;
+                const [rLabel, rColor] = RESULT_UI[resultOf(t)];
+                return (
+                  <div key={t.id} style={{ borderTop: n > 0 ? "0.5px solid var(--color-border-tertiary)" : "none", padding: "6px 0" }}>
+                    <button
+                      style={{ ...c.btn, width: "100%", textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, border: "none", padding: "8px 4px" }}
+                      onClick={() => setOpenFeedbackId(open ? null : t.id)}>
+                      <span style={{ fontSize: 13 }}>
+                        <span style={{ fontWeight: 500 }}>{t.question || t.market || "Trial"}</span>
+                        <span style={{ color: "var(--color-text-secondary)" }}> · {fmtDate(t)}</span>
+                        {t.targetRef && <span style={{ color: "#085041", fontWeight: 600, marginLeft: 8, letterSpacing: "0.05em" }}>REF #{t.targetRef}</span>}
+                      </span>
+                      <span style={{ fontSize: 12, color: rColor, fontWeight: 500, whiteSpace: "nowrap" }}>{rLabel} {open ? "▲" : "▼"}</span>
+                    </button>
+                    {open && (
+                      <div style={{ marginTop: 6 }}>
+                        <TrialImage trialId={t.id} side={getFeedbackSide(t)} style={{ ...c.imgFull, maxHeight: 460 }} />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -2141,7 +2256,7 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
                   { label: "High (7–10)", min: 7, max: 10 },
                 ].map(b => {
                   const ts = judgedTrials.filter(t => {
-                    const s = t.sessions?.find(se => se.viewerName === viewerName);
+                    const s = mine(t);
                     return s?.confidence >= b.min && s?.confidence <= b.max;
                   });
                   const c2 = ts.filter(t => t.actual === t.prediction).length;
@@ -2242,7 +2357,7 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
         <>
           <p style={{ ...c.label, marginBottom: "0.5rem" }}>Active Trials</p>
           {activeTrials.map(t => {
-            const done = t.sessions?.some(s => s.viewerName === viewerName);
+            const done = !!mine(t);
             return (
               <div key={t.id} style={c.card}>
                 <div style={c.row}>
@@ -2264,292 +2379,200 @@ function ViewerView({ viewerName, trials, saving, notify, onSubmit }) {
   );
 }
 
-// ── Judge ─────────────────────────────────────────────────────────────────────
-function JudgeView({ trials, saving, notify, onSubmit }) {
-  const groupTrials = trials.filter(t => !t.solo);
-  const trial   = groupTrials.find(t => t.status === "viewing" && t.sessions?.length > 0);
-  const [votes, setVotes] = useState({});
-  const [notes, setNotes] = useState({});
-  const sessions = trial?.sessions || [];
-  const aCount   = Object.values(votes).filter(v => v === "A").length;
-  const bCount   = Object.values(votes).filter(v => v === "B").length;
-  const allVoted = sessions.length > 0 && sessions.every((_, i) => votes[i]);
-
-  return (
-    <div style={c.wrap}>
-      <h2 style={c.h1}>Judge Panel</h2>
-      <p style={c.muted}>Compare each session to both images — vote without knowing which outcome each image represents</p>
-      <Notify msg={notify} />
-
-      {!trial ? (
-        <div style={{ ...c.card, textAlign: "center", padding: "2rem" }}>
-          <p style={c.muted}>No sessions to judge yet. Wait for the viewer to submit.</p>
-        </div>
-      ) : (
-        <>
-          <div style={c.card}>
-            <div style={{ ...c.row, marginBottom: "0.75rem" }}>
-              <h3 style={{ ...c.h3, margin: 0 }}>Active trial</h3>
-              <Badge status={trial.status} />
-            </div>
-            <p style={c.muted}>For each session below, decide which image the description better matches. The outcome assignment is sealed from you.</p>
-            <div style={c.half}>
-              {["A","B"].map(s => (
-                <div key={s}>
-                  <p style={{ ...c.label, marginBottom: 6 }}>Image {s}</p>
-                  <TrialImage trialId={trial.id} side={s} style={c.imgBox} />
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {sessions.map((sess, i) => (
-            <div key={sess.sid || i} style={c.card}>
-              <div style={{ ...c.row, marginBottom: 10, flexWrap: "wrap", gap: 6 }}>
-                <p style={{ fontWeight: 500, fontSize: 14, margin: 0 }}>Session {i+1} — {sess.viewerName}</p>
-                {sessionDurationLabel(sess) && (
-                  <span style={{ fontSize: 12, color: "#085041", fontWeight: 600, background: "#08504112", padding: "2px 8px", borderRadius: 99 }}>
-                    ⏱ {sessionDurationLabel(sess)}
-                  </span>
-                )}
-                {sess.confidence && <ConfidencePill value={sess.confidence} />}
-              </div>
-              <SessionDisplay session={sess} trialId={trial.id} sessionIdx={i} showConfidence={false} />
-              <div style={{ ...c.sep, margin: "0.75rem 0" }} />
-              <label style={c.label}>Which image does this session better match?</label>
-              <div style={{ ...c.row, marginBottom: "0.75rem" }}>
-                {[["A","Image A"],["B","Image B"],["M","Mixed"]].map(([v,l]) => (
-                  <button key={v} style={{ ...c.btn, ...(votes[i] === v ? { background: "#085041", color: "white", borderColor: "#085041" } : {}) }}
-                    onClick={() => setVotes(p => ({ ...p, [i]: v }))}>{l}</button>
-                ))}
-              </div>
-              <div style={c.field}>
-                <label style={c.label}>Judging notes <span style={{ fontWeight: 400, textTransform: "none" }}>(optional)</span></label>
-                <textarea style={{ ...c.area, minHeight: 70 }} value={notes[i] || ""} onChange={e => setNotes(p => ({ ...p, [i]: e.target.value }))}
-                  placeholder="Which elements matched? Why did you choose this image?" />
-              </div>
-            </div>
-          ))}
-
-          <div style={{ ...c.card, background: "var(--color-background-secondary)" }}>
-            <p style={{ fontSize: 13, margin: "0 0 10px" }}>
-              Tally — A: <strong>{aCount}</strong> · B: <strong>{bCount}</strong>
-              {aCount !== bCount && aCount + bCount > 0 && <> · Majority → <strong>Image {aCount > bCount ? "A" : "B"}</strong></>}
-              {aCount === bCount && aCount > 0 && <> · <span style={{ color: "var(--color-text-warning)" }}>Tied — no trade</span></>}
-            </p>
-            <button style={c.btnP} disabled={!allVoted || saving}
-              onClick={() => onSubmit(trial.id, sessions.map((_, i) => ({ vote: votes[i] || "M", notes: notes[i] || "" })))}>
-              {saving ? "Submitting…" : `Submit Judgments (${Object.keys(votes).length}/${sessions.length})`}
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
 // ── App Shell ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [role, setRole]             = useState(null);
   const [viewerName, setViewerName] = useState("");
-  const [data, setData]             = useState(null);
-  const [loading, setLoading]       = useState(true);
-  const [loadError, setLoadError]   = useState(false);
+  const [data, setData]             = useState(null);   // the shared trial list (trial records only)
+  const [extra, setExtra]           = useState({});     // new-style sessions, kept as separate records
+  const [loading, setLoading]       = useState(true);   // first load only
+  const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving]         = useState(false);
   const [notify, setNotify]         = useState(null);
-  const lastGoodRef = useRef(null);
-  const queueRef    = useRef(Promise.resolve());
-  const busyRef     = useRef(0);
-  const stampRef    = useRef(0);
+  const writeEpoch = useRef(0);       // bumped on every save so a slow background refresh can't show stale data
+  const busy       = useRef(false);
+  const flashTimer = useRef(null);
 
-  function flash(msg) { setNotify(msg); setTimeout(() => setNotify(null), 4000); }
+  const trials = useMemo(() => mergeTrials(data?.trials || [], extra), [data, extra]);
 
-  // Full load (first screen). Never shows an empty list if storage simply failed.
-  async function refresh() {
-    setLoading(true);
-    const { data: d, failed } = await loadTrialDataSafe();
-    if (failed) setLoadError(true);
-    else { setLoadError(false); lastGoodRef.current = d; setData(d); }
-    setLoading(false);
+  function flash(msg) {
+    setNotify(msg);
+    clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setNotify(null), 4000);
   }
 
-  // Background refresh – does NOT unmount the screen, so a viewer's half-finished session is never lost
-  async function silentRefresh() {
-    if (busyRef.current > 0) return;
-    const stamp = stampRef.current;
-    const { data: d, failed, empty } = await loadTrialDataSafe();
-    if (failed || (empty && lastGoodRef.current?.trials?.length)) return;
-    if (busyRef.current > 0 || stamp !== stampRef.current) return;
-    lastGoodRef.current = d;
-    setData(prev => (prev && JSON.stringify(prev) === JSON.stringify(d)) ? prev : d);
-  }
-
-  // Read the LATEST data, apply the change, save, then re-read to confirm it stuck (retries if
-  // someone else's save overwrote it). Local saves are queued so they never overlap.
-  async function runUpdate(mutator, verify) {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const { data: fresh, failed, empty, raw } = await loadTrialDataSafe();
-      if ((failed || empty) && lastGoodRef.current?.trials?.length)
-        throw new Error("Could not reach storage — nothing was changed. Please try again.");
-      const next = mutator(fresh);
-      if (next === null || next === undefined) return { aborted: true };
-      if (raw && fresh.trials.length) { try { await window.storage.set(BACKUP_KEY, raw, true); } catch {} } // safety copy of previous state
-      await saveTrialData(next);
-      const check = await loadTrialDataSafe();
-      if (!check.failed && (!verify || verify(check.data))) {
-        stampRef.current++;
-        lastGoodRef.current = check.data;
-        setData(check.data);
-        return { ok: true, data: check.data };
+  // Reloads trials + sessions without ever blanking the screen (so a form in progress is never lost)
+  async function refresh({ full = false, quiet = false } = {}) {
+    if (busy.current) return;
+    busy.current = true;
+    if (!quiet) setRefreshing(true);
+    const epoch = writeEpoch.current;
+    try {
+      const { data: d, missing } = await readTrialData();
+      if (epoch !== writeEpoch.current) return;
+      if (missing && knownTrialCount > 0) {          // read failed — keep what's on screen, never replace it with "empty"
+        if (!quiet) flash("Couldn't reach storage — still showing the last loaded data");
+        return;
       }
-      await sleep(200 + Math.random() * 400);
+      const ex = await loadAllSessions(d.trials, full);
+      if (epoch !== writeEpoch.current) return;
+      setData(d);
+      setExtra(ex);
+    } finally {
+      busy.current = false;
+      setLoading(false);
+      if (!quiet) setRefreshing(false);
     }
-    throw new Error("Save could not be confirmed — please check and try again.");
   }
 
-  function updateData(mutator, verify) {
-    const job = queueRef.current.then(async () => {
-      busyRef.current++;
-      try { return await runUpdate(mutator, verify); } finally { busyRef.current--; }
-    });
-    queueRef.current = job.catch(() => {});
-    return job;
+  // Re-reads the latest saved trial list, applies one change, writes it back. Never writes from stale screen data.
+  async function commit(mutate) {
+    const fresh = await readTrialData();
+    if (fresh.missing && knownTrialCount > 0) throw new Error("Couldn't read the latest saved data, so nothing was changed. Please try again.");
+    const next = mutate(fresh.data);
+    await saveTrialData(next);
+    knownTrialCount = next.trials.length;
+    writeEpoch.current++;
+    setData(next);
   }
 
-  // updatesOrFn: object of fields, or (trial) => fields | null (null = abort)
-  function updateTrial(id, updatesOrFn, verify) {
-    return updateData(d => {
-      const t = d.trials.find(x => x.id === id);
-      if (!t) return null;
-      const upd = typeof updatesOrFn === "function" ? updatesOrFn(t) : updatesOrFn;
-      if (!upd) return null;
-      return { ...d, trials: d.trials.map(x => x.id === id ? { ...x, ...upd } : x) };
-    }, verify ? (nd => { const t = nd.trials.find(x => x.id === id); return !!t && verify(t); }) : undefined);
-  }
-
-  async function run(fn) {
+  async function run(fn, fallback) {
     setSaving(true);
-    try { return await fn(); }
-    catch (e) { flash("Error: " + (e.message || "Save failed")); return null; }
+    try { await fn(); return true; }
+    catch (e) { flash("Error: " + (e?.message || fallback)); return false; }
     finally { setSaving(false); }
   }
 
-  function applyUpdate(id, updates) {
-    const verify = (updates && typeof updates === "object" && updates.status) ? (t => t.status === updates.status) : undefined;
-    return run(() => updateTrial(id, updates, verify));
-  }
+  const updateTrial = (id, updates) =>
+    run(() => commit(d => ({ ...d, trials: d.trials.map(t => t.id === id ? { ...t, ...updates } : t) })), "Save failed");
 
-  async function handleCreate(t) {
-    const res = await run(async () => {
+  function handleCreate(t) {
+    return run(async () => {
       await saveImg(t.id, "A", t.imgA);
       await saveImg(t.id, "B", t.imgB);
-      await addRecentTargets(t.nameA || `trial-${t.id}-A`, t.nameB || `trial-${t.id}-B`);
       const slim = { ...t };
       delete slim.imgA; delete slim.imgB; delete slim.nameA; delete slim.nameB;
-      return updateData(
-        d => d.trials.some(x => x.id === slim.id) ? d : { ...d, trials: [slim, ...d.trials] },
-        nd => nd.trials.some(x => x.id === slim.id)
-      );
-    });
-    if (res?.ok) { flash("Trial created"); return true; }
-    return false;
+      await commit(d => ({ ...d, trials: [slim, ...d.trials] }));
+      // Register these images as recently used so future trials avoid them
+      await addRecentTargets(t.nameA || `trial-${t.id}-A`, t.nameB || `trial-${t.id}-B`);
+      flash("Trial created");
+    }, "Could not save trial");
   }
 
-  async function handleRepeat(originalTrialId) {
-    const original = (data?.trials || []).find(t => t.id === originalTrialId);
-    if (!original) { flash("Could not find original trial"); return; }
-    const res = await run(async () => {
+  function handleRepeat(originalTrialId) {
+    return run(async () => {
+      const original = (data?.trials || []).find(t => t.id === originalTrialId);
+      if (!original) throw new Error("Could not find original trial");
       const newId = uid();
+      // Copy images to new storage keys
       const [imgA, imgB] = await Promise.all([loadImg(originalTrialId, "A"), loadImg(originalTrialId, "B")]);
       if (!imgA || !imgB) throw new Error("Could not load original images");
       await saveImg(newId, "A", imgA);
       await saveImg(newId, "B", imgB);
       const newTrial = {
-        ...original, id: newId, createdAt: new Date().toISOString(),
-        targetRef: genTargetRef(), upImage: Math.random() < 0.5 ? "A" : "B",
-        status: "viewing", sessions: [], judgments: [], prediction: null, actual: null, feedbackSide: null,
+        ...original,
+        id: newId,
+        targetRef: genTargetRef(),
+        upImage: Math.random() < 0.5 ? "A" : "B",
+        status: "viewing",
+        sessions: [],
+        judgments: [],
+        prediction: null,
+        actual: null,
+        feedbackSide: null,
+        completedAt: null,
         repeatedFrom: originalTrialId,
       };
-      return updateData(
-        d => d.trials.some(x => x.id === newId) ? d : { ...d, trials: [newTrial, ...d.trials] },
-        nd => nd.trials.some(x => x.id === newId)
-      );
-    });
-    if (res?.ok) flash("New trial opened — same target, new reference number");
+      await commit(d => ({ ...d, trials: [newTrial, ...d.trials] }));
+      flash("New trial opened — same target, new reference number");
+    }, "Could not repeat trial");
   }
 
-  useEffect(() => { refresh(); }, []);
-  // Everyone's screen picks up new sessions / released feedback automatically
+  // Saves one viewer session as its own record (+ its sketches under its own id). Safe for simultaneous viewers.
+  async function handleAddSession(trialId, name, sessionData, ideogramData, siteSketchData) {
+    setSaving(true);
+    try {
+      const sid = "s" + uid();
+      if (ideogramData)   await saveSketch(trialId, sid, "ideogram", ideogramData);
+      if (siteSketchData) await saveSketch(trialId, sid, "site",     siteSketchData);
+      const session = { id: sid, viewerName: name, ...sessionData, timestamp: new Date().toISOString() };
+      const res = await window.storage.set(sessKey(trialId, sid), JSON.stringify(session), true);
+      if (!res) throw new Error("Could not save your session — please try again");
+      await addSessionToIndex(trialId, sid);
+      sessionRecCache[sid] = session;
+      sessionsByTrial[trialId] = unionById(sessionsByTrial[trialId] || [], [session]);
+      setExtra(prev => ({ ...prev, [trialId]: unionById(prev[trialId] || [], [session]) }));
+      flash("Session submitted");
+      return true;
+    } catch (e) {
+      flash("Error: " + (e?.message || "Could not submit session"));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleJudge(trialId, judgments) {
+    const t = trials.find(x => x.id === trialId);
+    let prediction = null;
+    const ok = await run(() => commit(d => ({
+      ...d,
+      trials: d.trials.map(x => {
+        if (x.id !== trialId) return x;
+        const valid = judgments.map(j => j.vote).filter(v => v !== "M");
+        const a = valid.filter(v => v === "A").length;
+        const b = valid.filter(v => v === "B").length;
+        const winner = a > b ? "A" : b > a ? "B" : null;
+        prediction = winner === null ? null : winner === x.upImage ? "Up" : "Down";
+        return { ...x, judgments, prediction, status: "predicted" };
+      }),
+    })), "Could not save judgments");
+    if (ok) flash(prediction ? `Prediction: ${outLabel(t, prediction)}` : "Tied — no clear prediction");
+    return ok;
+  }
+
+  useEffect(() => { refresh({ full: true, quiet: true }); }, []);
+
+  // Pick up new sessions / outcomes automatically (every 15s and whenever the tab is shown again)
   useEffect(() => {
-    const id = setInterval(() => { if (!document.hidden) silentRefresh(); }, 15000);
-    return () => clearInterval(id);
-  }, []);
+    if (!role) return;
+    const tick = () => { if (!document.hidden) refresh({ quiet: true }); };
+    const id = setInterval(tick, 15000);
+    document.addEventListener("visibilitychange", tick);
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", tick); };
+  }, [role]);
 
   if (loading) return <div style={{ ...c.wrap, paddingTop: "3rem", textAlign: "center", color: "var(--color-text-secondary)" }}>Loading…</div>;
-  if (loadError || !data) return (
-    <div style={{ ...c.wrap, paddingTop: "3rem", textAlign: "center" }}>
-      <p style={c.muted}>Couldn't load the experiment data. Nothing has been changed or deleted.</p>
-      <button style={c.btnP} onClick={refresh}>Retry</button>
-    </div>
-  );
-  if (!role) return <RoleSelect onSelect={(r, n) => { setRole(r); setViewerName(n || ""); }} />;
+  if (!role)   return <RoleSelect onSelect={(r, n) => { setRole(r); setViewerName(n || ""); }} />;
 
-  const trials = data?.trials || [];
   const toolbar = (
     <div style={{ ...c.row, padding: "0.75rem 1.25rem 0", justifyContent: "flex-end" }}>
-      <button style={{ ...c.btn, fontSize: 12 }} onClick={() => silentRefresh()}>↺ Refresh</button>
+      <button style={{ ...c.btn, fontSize: 12 }} disabled={refreshing} onClick={() => refresh({ full: true })}>{refreshing ? "Refreshing…" : "↺ Refresh"}</button>
       <button style={{ ...c.btn, fontSize: 12 }} onClick={() => setRole(null)}>← Home</button>
     </div>
   );
 
   if (role === "solo") return (
     <>{toolbar}<SoloView viewerName={viewerName} trials={trials} saving={saving} notify={notify}
-      onCreate={handleCreate} onRepeat={handleRepeat}
-      onUpdate={async (id, updates) => { await applyUpdate(id, updates); }} /></>
+      onCreate={handleCreate} onRepeat={handleRepeat} onAddSession={handleAddSession}
+      onUpdate={updateTrial} /></>
   );
 
   if (role === "coordinator") return (
     <>{toolbar}<CoordView trials={trials} saving={saving} notify={notify}
       onCreate={handleCreate} onRepeat={handleRepeat}
       onUpdate={async (id, updates) => {
-        const r = await applyUpdate(id, updates);
-        if (r?.ok) flash(updates.status === "complete" ? "Outcome recorded — feedback released" : "Saved");
+        const ok = await updateTrial(id, updates);
+        if (ok) flash(updates.status === "complete" ? "Outcome recorded — feedback released" : "Saved");
+        return ok;
       }}
-      onJudge={async (trialId, judgments) => {
-        const res = await run(() => updateTrial(trialId, t => {
-          if (t.status !== "viewing" || (t.sessions || []).length !== judgments.length) return null;
-          const valid = judgments.map(j => j.vote).filter(v => v !== "M");
-          const a = valid.filter(v => v === "A").length;
-          const b = valid.filter(v => v === "B").length;
-          const winner = a > b ? "A" : b > a ? "B" : null;
-          const prediction = winner === null ? null : winner === t.upImage ? "Up" : "Down";
-          return { judgments, prediction, status: "predicted" };
-        }, t => t.status === "predicted"));
-        if (res?.ok) {
-          const t = res.data.trials.find(x => x.id === trialId);
-          flash(t?.prediction ? `Prediction: ${outLabel(t, t.prediction)}` : "Tied — no clear prediction");
-        } else if (res?.aborted) {
-          flash("A new session came in (or this trial was already judged) — review the sessions and submit again.");
-        }
-      }} /></>
+      onJudge={handleJudge} /></>
   );
 
   if (role === "viewer") return (
     <>{toolbar}<ViewerView viewerName={viewerName} trials={trials} saving={saving} notify={notify}
-      onSubmit={async (trialId, sessionData, ideogramData, siteSketchData) => {
-        const sid = uid();   // unique id → sketches can never collide between viewers
-        if (ideogramData)   { try { await saveSketch(trialId, sid, "ideogram", ideogramData); } catch {} }
-        if (siteSketchData) { try { await saveSketch(trialId, sid, "site", siteSketchData); } catch {} }
-        const session = { sid, viewerName, ...sessionData, timestamp: new Date().toISOString() };
-        const res = await run(() => updateTrial(trialId, t => {
-          const list = t.sessions || [];
-          if (list.some(s => s.sid === sid)) return {};                                   // already saved
-          if (t.status !== "viewing" || list.some(s => s.viewerName === viewerName)) return null;
-          return { sessions: [...list, session] };                                        // added to the LATEST list
-        }, t => (t.sessions || []).some(s => s.sid === sid)));
-        if (res?.ok) flash("Session submitted");
-        else if (res?.aborted) flash("Could not submit — this trial is closed or you already submitted a session.");
-      }} /></>
+      onSubmit={(trialId, sessionData, ideogramData, siteSketchData) =>
+        handleAddSession(trialId, viewerName, sessionData, ideogramData, siteSketchData)} /></>
   );
 
   return null;
